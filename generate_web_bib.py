@@ -24,6 +24,58 @@ COMMENT_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
+ENTRY_START_RE = re.compile(
+    r"""
+    ^\s*
+    @
+    (?!string\b|comment\b|preamble\b)
+    [A-Za-z]+
+    \s*[\{\(]
+    """,
+    re.IGNORECASE | re.MULTILINE | re.VERBOSE,
+)
+
+YEAR_RE = re.compile(
+    r"""
+    ^\s*
+    year
+    \s*=\s*
+    [\{"']?
+    (?P<year>\d{4})
+    [\}"']?
+    \s*,?
+    \s*$
+    """,
+    re.IGNORECASE | re.MULTILINE | re.VERBOSE,
+)
+
+AUTHOR_RE = re.compile(
+    r"^\s*author\s*=",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+EDITOR_RE = re.compile(
+    r"""
+    ^(?P<indent>\s*)
+    editor
+    \s*=\s*
+    (?P<value>
+        \{
+            (?:
+                [^{}]
+                |
+                \{[^{}]*\}
+            )*
+        \}
+        |
+        "[^"]*"
+    )
+    \s*,?
+    \s*$
+    """,
+    re.IGNORECASE | re.MULTILINE | re.VERBOSE,
+)
+
 
 def unwrap_value(value: str) -> str:
     """
@@ -53,7 +105,7 @@ def extract_strings_and_clean(text: str) -> tuple[dict[str, str], str]:
     strings: dict[str, str] = {}
     retained_lines: list[str] = []
 
-    for line_number, line in enumerate(text.splitlines(), start=1):
+    for line in text.splitlines():
         string_match = STRING_LINE_RE.match(line)
 
         if string_match:
@@ -125,15 +177,164 @@ def expand_string_fields(text: str, strings: dict[str, str]) -> str:
     return pattern.sub(replacement, text)
 
 
+def find_entry_end(text: str, start: int) -> int:
+    """
+    Return the position immediately after a complete BibTeX entry.
+
+    Nested braces and quoted strings are handled, so braces inside titles
+    and other field values do not terminate the entry prematurely.
+    """
+    opening_match = re.match(
+        r"\s*@[A-Za-z]+\s*([\{\(])",
+        text[start:],
+        re.IGNORECASE,
+    )
+
+    if opening_match is None:
+        raise RuntimeError(
+            f"Could not parse the BibTeX entry near character {start}."
+        )
+
+    opening = opening_match.group(1)
+    closing = "}" if opening == "{" else ")"
+    opening_position = start + opening_match.end() - 1
+
+    depth = 0
+    in_quotes = False
+    escaped = False
+
+    for index in range(opening_position, len(text)):
+        character = text[index]
+
+        if escaped:
+            escaped = False
+            continue
+
+        if character == "\\":
+            escaped = True
+            continue
+
+        if character == '"':
+            in_quotes = not in_quotes
+            continue
+
+        if in_quotes:
+            continue
+
+        if character == opening:
+            depth += 1
+        elif character == closing:
+            depth -= 1
+
+            if depth == 0:
+                return index + 1
+
+    raise RuntimeError(
+        f"Unclosed BibTeX entry beginning near character {start}."
+    )
+
+
+def split_publication_entries(text: str) -> list[str]:
+    """
+    Extract all publication entries as complete BibTeX blocks.
+    """
+    entries: list[str] = []
+    position = 0
+
+    while True:
+        match = ENTRY_START_RE.search(text, position)
+
+        if match is None:
+            break
+
+        start = match.start()
+        end = find_entry_end(text, start)
+        entries.append(text[start:end].strip())
+        position = end
+
+    return entries
+
+
+def add_author_fallback_from_editor(entry: str) -> tuple[str, bool]:
+    """
+    Add an author field to an editor-only entry for the web renderer.
+
+    The original editor field remains unchanged. This only affects the
+    generated web BibTeX file.
+    """
+    if AUTHOR_RE.search(entry):
+        return entry, False
+
+    editor_match = EDITOR_RE.search(entry)
+
+    if editor_match is None:
+        return entry, False
+
+    header_match = re.match(
+        r"""
+        (?P<header>
+            \s*
+            @[A-Za-z]+
+            \s*[\{\(]
+            \s*[^,]+
+            \s*,
+        )
+        """,
+        entry,
+        re.IGNORECASE | re.VERBOSE,
+    )
+
+    if header_match is None:
+        return entry, False
+
+    editor_value = editor_match.group("value")
+    insertion_position = header_match.end()
+
+    updated = (
+        entry[:insertion_position]
+        + "\n  author = "
+        + editor_value
+        + ","
+        + entry[insertion_position:]
+    )
+
+    return updated, True
+
+
+def publication_year(entry: str) -> int | None:
+    """
+    Return an entry's four-digit year, or None if no valid year is found.
+    """
+    match = YEAR_RE.search(entry)
+
+    if match is None:
+        return None
+
+    return int(match.group("year"))
+
+
+def sort_entries_newest_first(entries: list[str]) -> list[str]:
+    """
+    Sort entries by descending year.
+
+    Python's sort is stable, so entries with the same year retain their
+    original relative order. Entries without a valid year are placed last.
+    """
+    return sorted(
+        entries,
+        key=lambda entry: (
+            publication_year(entry) is None,
+            -(publication_year(entry) or 0),
+        ),
+    )
+
+
 def count_publications(text: str) -> int:
     """
-    Count bibliography records while excluding @string and @comment.
+    Count bibliography records while excluding @string, @comment,
+    and @preamble.
     """
-    entry_pattern = re.compile(
-        r"^\s*@(?!string\b|comment\b|preamble\b)[A-Za-z]+\s*[\{\(]",
-        re.IGNORECASE | re.MULTILINE,
-    )
-    return len(entry_pattern.findall(text))
+    return len(ENTRY_START_RE.findall(text))
 
 
 def main() -> None:
@@ -147,7 +348,19 @@ def main() -> None:
     input_entries = count_publications(source)
     strings, cleaned = extract_strings_and_clean(source)
     expanded = expand_string_fields(cleaned, strings)
-    output_entries = count_publications(expanded)
+
+    entries = split_publication_entries(expanded)
+
+    editor_fallbacks = 0
+    web_entries: list[str] = []
+
+    for entry in entries:
+        updated_entry, fallback_added = add_author_fallback_from_editor(entry)
+        web_entries.append(updated_entry)
+        editor_fallbacks += int(fallback_added)
+
+    sorted_entries = sort_entries_newest_first(web_entries)
+    output_entries = len(sorted_entries)
 
     if input_entries == 0:
         raise RuntimeError(
@@ -163,18 +376,39 @@ def main() -> None:
 
     header = (
         "% This file is generated automatically from myRefs.bib.\n"
-        "% Do not edit this file directly.\n\n"
+        "% Do not edit this file directly.\n"
+        "% Entries are sorted from newest to oldest.\n"
+        "% Editor-only entries receive an author fallback for the web renderer.\n\n"
     )
 
+    output_text = header + "\n\n".join(sorted_entries) + "\n"
+
     OUTPUT_FILE.write_text(
-        header + expanded.lstrip(),
+        output_text,
         encoding="utf-8",
+    )
+
+    years = [
+        publication_year(entry)
+        for entry in sorted_entries
+        if publication_year(entry) is not None
+    ]
+
+    year_range = (
+        f"{max(years)}–{min(years)}"
+        if years
+        else "no valid years found"
     )
 
     print(
         f"Wrote {OUTPUT_FILE} with "
         f"{len(strings)} string definitions expanded "
         f"across {output_entries} publication entries."
+    )
+    print(f"Sorted entries newest first ({year_range}).")
+    print(
+        "Added author fallbacks from editor fields for "
+        f"{editor_fallbacks} editor-only entries."
     )
 
 
