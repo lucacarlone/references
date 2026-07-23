@@ -5,102 +5,80 @@ INPUT_FILE = Path("myRefs.bib")
 OUTPUT_FILE = Path("myRefs-web.bib")
 
 
-def find_balanced_block(text: str, start: int) -> tuple[str, int]:
+STRING_LINE_RE = re.compile(
+    r"""
+    ^\s*
+    @string
+    \s*\{
+    \s*(?P<name>[A-Za-z_][A-Za-z0-9_:\-]*)
+    \s*=\s*
+    (?P<value>.+)
+    \}
+    \s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+COMMENT_LINE_RE = re.compile(
+    r"^\s*@comment\s*\{.*\}\s*$",
+    re.IGNORECASE,
+)
+
+
+def unwrap_value(value: str) -> str:
     """
-    Return the contents of a brace-delimited block and the index
-    immediately after its closing brace.
+    Remove the outer braces or quotes from an @string value.
+
+    Example:
+        {{IEEE} Trans. Robotics}
+    becomes:
+        {IEEE} Trans. Robotics
     """
-    if text[start] != "{":
-        raise ValueError("Expected opening brace")
+    value = value.strip().rstrip(",").strip()
 
-    depth = 0
+    if value.startswith("{") and value.endswith("}"):
+        return value[1:-1]
 
-    for i in range(start, len(text)):
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
+    if value.startswith('"') and value.endswith('"'):
+        return value[1:-1]
 
-            if depth == 0:
-                return text[start + 1:i], i + 1
-
-    raise ValueError("Unbalanced braces")
+    return value
 
 
-def extract_string_definitions(text: str) -> tuple[dict[str, str], str]:
+def extract_strings_and_clean(text: str) -> tuple[dict[str, str], str]:
     """
-    Extract @string definitions and remove them from the bibliography.
+    Extract one-line @string declarations while preserving all
+    publication entries.
     """
     strings: dict[str, str] = {}
-    output_parts: list[str] = []
+    retained_lines: list[str] = []
 
-    pattern = re.compile(r"@string\s*\{", re.IGNORECASE)
-    position = 0
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        string_match = STRING_LINE_RE.match(line)
 
-    while True:
-        match = pattern.search(text, position)
+        if string_match:
+            name = string_match.group("name").lower()
+            value = unwrap_value(string_match.group("value"))
+            strings[name] = value
+            continue
 
-        if match is None:
-            output_parts.append(text[position:])
-            break
+        if COMMENT_LINE_RE.match(line):
+            continue
 
-        output_parts.append(text[position:match.start()])
+        retained_lines.append(line)
 
-        opening_brace = match.end() - 1
-        contents, end = find_balanced_block(text, opening_brace)
-
-        name, separator, value = contents.partition("=")
-
-        if not separator:
-            raise ValueError(f"Malformed @string definition: {contents}")
-
-        name = name.strip().lower()
-        value = value.strip()
-
-        if value.startswith("{") and value.endswith("}"):
-            value = value[1:-1]
-        elif value.startswith('"') and value.endswith('"'):
-            value = value[1:-1]
-
-        strings[name] = value
-        position = end
-
-    return strings, "".join(output_parts)
-
-
-def remove_comment_entries(text: str) -> str:
-    """
-    Remove BibDesk @comment records, which are not needed by the website.
-    """
-    pattern = re.compile(r"@comment\s*\{", re.IGNORECASE)
-    output_parts: list[str] = []
-    position = 0
-
-    while True:
-        match = pattern.search(text, position)
-
-        if match is None:
-            output_parts.append(text[position:])
-            break
-
-        output_parts.append(text[position:match.start()])
-
-        opening_brace = match.end() - 1
-        _, end = find_balanced_block(text, opening_brace)
-        position = end
-
-    return "".join(output_parts)
+    return strings, "\n".join(retained_lines) + "\n"
 
 
 def expand_string_fields(text: str, strings: dict[str, str]) -> str:
     """
-    Replace bare string identifiers in common bibliographic fields.
+    Expand bare @string identifiers in venue-related fields.
 
     Example:
-        journal = tro
+        booktitle = rss,
 
     becomes:
-        journal = {{IEEE} Trans. Robotics}
+        booktitle = {Robotics: Science and Systems (RSS)},
     """
     fields = (
         "journal",
@@ -110,19 +88,29 @@ def expand_string_fields(text: str, strings: dict[str, str]) -> str:
         "school",
         "organization",
         "series",
+        "address",
     )
 
-    field_pattern = "|".join(fields)
+    field_names = "|".join(re.escape(field) for field in fields)
 
     pattern = re.compile(
-        rf"(?P<prefix>\b(?:{field_pattern})\s*=\s*)"
-        rf"(?P<value>[A-Za-z_][A-Za-z0-9_:\-]*)"
-        rf"(?P<suffix>\s*[,}}])",
-        re.IGNORECASE,
+        rf"""
+        (?P<prefix>
+            \b(?:{field_names})
+            \s*=\s*
+        )
+        (?P<identifier>
+            [A-Za-z_][A-Za-z0-9_:\-]*
+        )
+        (?P<suffix>
+            \s*(?:,|\}})
+        )
+        """,
+        re.IGNORECASE | re.VERBOSE,
     )
 
-    def replace(match: re.Match[str]) -> str:
-        identifier = match.group("value")
+    def replacement(match: re.Match[str]) -> str:
+        identifier = match.group("identifier")
         expanded = strings.get(identifier.lower())
 
         if expanded is None:
@@ -134,26 +122,59 @@ def expand_string_fields(text: str, strings: dict[str, str]) -> str:
             f"{match.group('suffix')}"
         )
 
-    return pattern.sub(replace, text)
+    return pattern.sub(replacement, text)
+
+
+def count_publications(text: str) -> int:
+    """
+    Count bibliography records while excluding @string and @comment.
+    """
+    entry_pattern = re.compile(
+        r"^\s*@(?!string\b|comment\b|preamble\b)[A-Za-z]+\s*[\{\(]",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    return len(entry_pattern.findall(text))
 
 
 def main() -> None:
-    text = INPUT_FILE.read_text(encoding="utf-8")
+    if not INPUT_FILE.exists():
+        raise FileNotFoundError(
+            f"Could not find {INPUT_FILE.resolve()}"
+        )
 
-    strings, text_without_strings = extract_string_definitions(text)
-    text_without_comments = remove_comment_entries(text_without_strings)
-    expanded = expand_string_fields(text_without_comments, strings)
+    source = INPUT_FILE.read_text(encoding="utf-8")
+
+    input_entries = count_publications(source)
+    strings, cleaned = extract_strings_and_clean(source)
+    expanded = expand_string_fields(cleaned, strings)
+    output_entries = count_publications(expanded)
+
+    if input_entries == 0:
+        raise RuntimeError(
+            "No publication entries were found in myRefs.bib."
+        )
+
+    if output_entries != input_entries:
+        raise RuntimeError(
+            "Publication count changed during conversion: "
+            f"{input_entries} input entries versus "
+            f"{output_entries} output entries."
+        )
 
     header = (
         "% This file is generated automatically from myRefs.bib.\n"
         "% Do not edit this file directly.\n\n"
     )
 
-    OUTPUT_FILE.write_text(header + expanded.lstrip(), encoding="utf-8")
+    OUTPUT_FILE.write_text(
+        header + expanded.lstrip(),
+        encoding="utf-8",
+    )
 
     print(
         f"Wrote {OUTPUT_FILE} with "
-        f"{len(strings)} expanded string definitions."
+        f"{len(strings)} string definitions expanded "
+        f"across {output_entries} publication entries."
     )
 
 
