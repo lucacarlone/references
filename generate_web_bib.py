@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 import re
 
@@ -301,6 +303,56 @@ def add_author_fallback_from_editor(entry: str) -> tuple[str, bool]:
     return updated, True
 
 
+
+
+LINK_RE = re.compile(
+    r"\\linkTo(?P<kind>Pdf|Code|Web|Video)\s*\{(?P<url>[^{}]+)\}",
+    re.IGNORECASE,
+)
+
+
+def convert_note_links(entry: str) -> tuple[str, dict[str, int]]:
+    """Expose LaTeX link macros as BibTeX-js fields in the web-only copy.
+
+    PDF macros are removed (the existing pdf field takes precedence).
+    Any other note text is preserved. For repeated links of the same type,
+    use the first link and report the rest rather than silently overwriting.
+    """
+    links: dict[str, str] = {}
+    counts = {"pdf": 0, "code": 0, "web": 0, "video": 0}
+
+    def remove_macro(match: re.Match[str]) -> str:
+        kind = match.group("kind").lower()
+        counts[kind] += 1
+        links.setdefault(kind, match.group("url").strip())
+        return ""
+
+    # Match the macros wherever they occur in the entry, including multiline notes.
+    entry = LINK_RE.sub(remove_macro, entry)
+
+    # Remove note fields that contain only separators after link removal.
+    entry = re.sub(
+        r"(?mi)^[ \t]*note\s*=\s*\{[\s,;]*\}\s*,?[ \t]*\n?",
+        "",
+        entry,
+    )
+
+    # Add missing web-only fields, without overwriting explicitly defined ones.
+    additions = []
+    for kind in ("code", "web", "video"):
+        if kind in links and not re.search(rf"(?mi)^\s*{kind}\s*=", entry):
+            additions.append(f"  {kind} = {{{links[kind]}}},")
+
+    if additions:
+        closing = len(entry) - 1
+        body = entry[:closing].rstrip()
+        if not body.endswith(","):
+            body += ","
+        entry = body + "\n" + "\n".join(additions) + "\n" + entry[closing:]
+
+    return entry, counts
+
+
 def publication_year(entry: str) -> int | None:
     """
     Return an entry's four-digit year, or None if no valid year is found.
@@ -354,8 +406,12 @@ def main() -> None:
     editor_fallbacks = 0
     web_entries: list[str] = []
 
+    link_counts = {"pdf": 0, "code": 0, "web": 0, "video": 0}
     for entry in entries:
         updated_entry, fallback_added = add_author_fallback_from_editor(entry)
+        updated_entry, counts = convert_note_links(updated_entry)
+        for kind, count in counts.items():
+            link_counts[kind] += count
         web_entries.append(updated_entry)
         editor_fallbacks += int(fallback_added)
 
@@ -406,6 +462,7 @@ def main() -> None:
         f"across {output_entries} publication entries."
     )
     print(f"Sorted entries newest first ({year_range}).")
+    print("Processed link macros: " + ", ".join(f"{key}={value}" for key, value in link_counts.items()))
     print(
         "Added author fallbacks from editor fields for "
         f"{editor_fallbacks} editor-only entries."
